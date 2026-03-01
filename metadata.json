@@ -1,0 +1,5 @@
+{
+  "name": "CodeFlow Animator",
+  "description": "A real-time code typing animator with syntax highlighting and in-browser Python execution.",
+  "requestFramePermissions": []
+}
