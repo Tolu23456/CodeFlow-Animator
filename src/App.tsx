@@ -1,10 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { flushSync } from 'react-dom';
-import { Play, RotateCcw, Settings, Code, Terminal, Zap, Cpu, Pause, Sun, Moon, Download, Video, Camera } from 'lucide-react';
+import { Play, RotateCcw, Settings, Code, Terminal, Zap, Cpu, Pause, Sun, Moon, Download } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Prism from 'prismjs';
-import { toPng } from 'html-to-image';
-import gifshot from 'gifshot';
 import 'prismjs/components/prism-python';
 import 'prismjs/components/prism-javascript';
 import 'prismjs/components/prism-css';
@@ -39,15 +37,11 @@ interface AppState {
   isWaitingForInput: boolean;
   inputPrompt: string;
   currentInputValue: string;
-  isRecording: boolean;
-  recordingProgress: number;
   showLivePreview: boolean;
   pyodideStatus: 'idle' | 'loading' | 'ready' | 'error';
   pyodideError: string | null;
   isConsoleCollapsed: boolean;
   packages: string;
-  fps: number;
-  exportFormat: 'gif' | 'mp4';
   previewBg: string;
 }
 
@@ -78,15 +72,11 @@ export default function App() {
     isWaitingForInput: false,
     inputPrompt: '',
     currentInputValue: '',
-    isRecording: false,
-    recordingProgress: 0,
     showLivePreview: true,
     pyodideStatus: 'idle',
     pyodideError: null,
     isConsoleCollapsed: false,
     packages: '',
-    fps: 30,
-    exportFormat: 'mp4',
     previewBg: 'transparent',
   });
 
@@ -97,14 +87,15 @@ export default function App() {
   const pyodideRef = useRef<any>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const inputResolveRef = useRef<((value: string) => void) | null>(null);
-  const consoleInputRef = useRef<HTMLInputElement>(null);
-  const recordingFramesRef = useRef<string[]>([]);
-  const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const consoleInputRef = useRef<HTMLTextAreaElement>(null);
 
   // Focus console input when waiting
   useEffect(() => {
     if (state.isWaitingForInput && consoleInputRef.current) {
       consoleInputRef.current.focus();
+      // Reset height for textarea
+      consoleInputRef.current.style.height = 'auto';
+      consoleInputRef.current.style.height = consoleInputRef.current.scrollHeight + 'px';
     }
   }, [state.isWaitingForInput]);
 
@@ -165,12 +156,20 @@ export default function App() {
   };
 
   // Initialize Pyodide
-  useEffect(() => {
-    const initPyodide = async () => {
+  const isInitializingRef = useRef(false);
+  const initPyodide = useCallback(async (attempts = 0) => {
+    if (isInitializingRef.current && attempts === 0) return;
+    if (attempts === 0) isInitializingRef.current = true;
+
+    const maxAttempts = 50; // 5 seconds total
+
+    try {
       if (window.loadPyodide) {
         setState(prev => ({ ...prev, pyodideStatus: 'loading', pyodideError: null }));
         try {
-          pyodideRef.current = await window.loadPyodide();
+          pyodideRef.current = await window.loadPyodide({
+            indexURL: "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/"
+          });
           setState(prev => ({ ...prev, pyodideStatus: 'ready' }));
           console.log('Pyodide loaded successfully');
         } catch (err: any) {
@@ -181,25 +180,43 @@ export default function App() {
             pyodideError: err?.message || 'Failed to initialize Python environment. Please check your internet connection or try refreshing.' 
           }));
         }
+      } else if (attempts < maxAttempts) {
+        setTimeout(() => initPyodide(attempts + 1), 100);
       } else {
         setState(prev => ({ 
           ...prev, 
           pyodideStatus: 'error', 
-          pyodideError: 'Pyodide loader not found. Make sure the script is correctly included in index.html.' 
+          pyodideError: 'Pyodide loader not found. The script might have failed to load from the CDN.' 
         }));
       }
-    };
-    initPyodide();
+    } finally {
+      if (attempts === 0 || attempts >= maxAttempts || pyodideRef.current) {
+        isInitializingRef.current = false;
+      }
+    }
   }, []);
+
+  useEffect(() => {
+    initPyodide();
+  }, [initPyodide]);
 
   // Syntax Highlighting
   useEffect(() => {
     if (displayRef.current && state.displayedCode) {
-      try {
-        Prism.highlightElement(displayRef.current);
-      } catch (err) {
-        console.error('Prism highlighting error:', err);
-      }
+      // Use requestAnimationFrame to batch DOM updates and reduce flickering
+      requestAnimationFrame(() => {
+        if (!displayRef.current) return;
+        try {
+          // Instead of highlightElement which is more aggressive, 
+          // we can use highlight and set innerHTML which is often smoother
+          const lang = state.language === 'markup' ? 'html' : state.language;
+          const grammar = Prism.languages[lang] || Prism.languages.python;
+          const html = Prism.highlight(state.displayedCode, grammar, lang);
+          displayRef.current.innerHTML = html;
+        } catch (err) {
+          console.error('Prism highlighting error:', err);
+        }
+      });
     }
   }, [state.displayedCode, state.language]);
 
@@ -209,16 +226,39 @@ export default function App() {
   }, []);
 
   const runPython = useCallback(async () => {
+    // If it's still loading, wait a bit instead of failing immediately
+    if (state.pyodideStatus === 'loading') {
+      setState(prev => ({ ...prev, output: prev.output + `\n[System] Python environment is still initializing... please wait.\n` }));
+      
+      // Poll for readiness (max 10 seconds)
+      let pollCount = 0;
+      while (pollCount < 20) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        pollCount++;
+        
+        // We need to check the latest state, but since we are in a closure, 
+        // we'll check the ref if we had one, or just hope the next attempt works.
+        // Actually, a better way is to use a promise that resolves when ready.
+        if (pyodideRef.current) break;
+      }
+    }
+
     if (state.pyodideStatus !== 'ready' || !pyodideRef.current) {
       const errorMsg = state.pyodideStatus === 'loading' 
-        ? 'Python environment is still loading. Please wait a moment...' 
+        ? 'Python environment is taking longer than expected to load. Please try again in a few seconds.' 
         : (state.pyodideError || 'Python environment is not available.');
       
-      setState(prev => ({ 
-        ...prev, 
-        output: prev.output + `\n[System] ${errorMsg}\n`,
-        isExecuting: false 
-      }));
+      const systemMsg = `\n[System] ${errorMsg}\n`;
+      
+      // Avoid repeating the same system message if it was the last thing
+      setState(prev => {
+        if (prev.output.endsWith(systemMsg)) return prev;
+        return { 
+          ...prev, 
+          output: prev.output + systemMsg,
+          isExecuting: false 
+        };
+      });
       return;
     }
 
@@ -361,7 +401,9 @@ export default function App() {
     const lines = codeToType.split('\n');
     let currentLineIndex = 0;
 
+    let isFinished = false;
     const typeNext = () => {
+      if (isFinished) return;
       try {
         if (state.mode === 'char') {
           if (currentIndex < codeToType.length) {
@@ -372,6 +414,7 @@ export default function App() {
             currentIndex++;
             playTypingSound();
           } else {
+            isFinished = true;
             stopTyping();
             if (state.language === 'python') runPython();
           }
@@ -384,153 +427,20 @@ export default function App() {
             currentLineIndex++;
             playTypingSound();
           } else {
+            isFinished = true;
             stopTyping();
             if (state.language === 'python') runPython();
           }
         }
       } catch (err) {
         console.error('Typing animation error:', err);
+        isFinished = true;
         stopTyping();
       }
     };
 
     typingRef.current = setInterval(typeNext, state.speed);
   }, [state.inputCode, state.mode, state.speed, state.isTyping, state.language, runPython, stopTyping, playTypingSound]);
-
-  const startRecording = useCallback(async () => {
-    if (!displayRef.current || !scrollContainerRef.current) return;
-    
-    setState(prev => ({ ...prev, isRecording: true, recordingProgress: 0 }));
-    recordingFramesRef.current = [];
-    
-    // Start the animation if not already typing
-    if (!state.isTyping) {
-      startTyping();
-    }
-
-    // Small delay to let the UI settle before first capture
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    const captureFrame = async () => {
-      if (scrollContainerRef.current) {
-        try {
-          const dataUrl = await toPng(scrollContainerRef.current, {
-            backgroundColor: state.theme === 'dark' ? '#050505' : '#ffffff',
-            width: scrollContainerRef.current.offsetWidth,
-            height: scrollContainerRef.current.offsetHeight,
-            pixelRatio: 2, // High resolution
-            filter: (node) => {
-              // Skip any elements that might cause issues with inlining
-              if (node.tagName === 'IFRAME' || node.tagName === 'SCRIPT') return false;
-              return true;
-            }
-          });
-          recordingFramesRef.current.push(dataUrl);
-        } catch (err) {
-          console.error('Frame capture error:', err);
-        }
-      }
-    };
-
-    recordingIntervalRef.current = setInterval(captureFrame, 1000 / state.fps);
-  }, [state.isTyping, state.theme, state.fps, startTyping]);
-
-  const stopRecording = useCallback(async () => {
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
-      recordingIntervalRef.current = null;
-    }
-
-    if (recordingFramesRef.current.length === 0) {
-      setState(prev => ({ ...prev, isRecording: false }));
-      return;
-    }
-
-    const frames = recordingFramesRef.current;
-    setState(prev => ({ ...prev, isRecording: false }));
-
-    if (state.exportFormat === 'gif') {
-      gifshot.createGIF({
-        images: frames,
-        gifWidth: 800,
-        gifHeight: 600,
-        interval: 1 / state.fps,
-        numFrames: frames.length,
-      }, (obj: any) => {
-        if (!obj.error) {
-          const link = document.createElement('a');
-          link.download = `code-animation-${Date.now()}.gif`;
-          link.href = obj.image;
-          link.click();
-        }
-        setState(prev => ({ ...prev, recordingProgress: 0 }));
-      });
-    } else {
-      // MP4 Export using MediaRecorder + Canvas
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      // Set canvas size based on first frame
-      const img = new Image();
-      img.src = frames[0];
-      await new Promise(resolve => img.onload = resolve);
-      canvas.width = img.width;
-      canvas.height = img.height;
-
-      const stream = canvas.captureStream(0); // Manual frame capture
-      const track = stream.getVideoTracks()[0] as any;
-      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') 
-        ? 'video/webm;codecs=vp9' 
-        : MediaRecorder.isTypeSupported('video/webm') 
-          ? 'video/webm' 
-          : 'video/ogg';
-      
-      const recorder = new MediaRecorder(stream, { mimeType });
-      const chunks: Blob[] = [];
-
-      recorder.ondataavailable = (e) => chunks.push(e.data);
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.download = `code-animation-${Date.now()}.webm`;
-        link.href = url;
-        link.click();
-      };
-
-      recorder.start();
-
-      for (const frame of frames) {
-        const frameImg = new Image();
-        frameImg.src = frame;
-        await new Promise(resolve => frameImg.onload = resolve);
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(frameImg, 0, 0);
-        
-        // Manually request a frame capture
-        if (track.requestFrame) {
-          track.requestFrame();
-        } else {
-          // Fallback for browsers without requestFrame
-          await new Promise(resolve => setTimeout(resolve, 1000 / state.fps));
-        }
-        
-        // Give some time for the recorder to process the frame
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-
-      // Final delay to ensure last frame is captured
-      await new Promise(resolve => setTimeout(resolve, 500));
-      recorder.stop();
-    }
-  }, [state.exportFormat, state.fps]);
-
-  useEffect(() => {
-    if (state.isRecording && !state.isTyping) {
-      stopRecording();
-    }
-  }, [state.isTyping, state.isRecording, stopRecording]);
 
   const reset = useCallback(() => {
     stopTyping();
@@ -649,8 +559,6 @@ export default function App() {
   const resetRef = useRef(reset);
   const runPythonRef = useRef(runPython);
   const stopExecutionRef = useRef(stopExecution);
-  const startRecordingRef = useRef(startRecording);
-  const stopRecordingRef = useRef(stopRecording);
   const stateRef = useRef(state);
 
   useEffect(() => {
@@ -662,9 +570,7 @@ export default function App() {
     resetRef.current = reset;
     runPythonRef.current = runPython;
     stopExecutionRef.current = stopExecution;
-    startRecordingRef.current = startRecording;
-    stopRecordingRef.current = stopRecording;
-  }, [startTyping, reset, runPython, stopExecution, startRecording, stopRecording]);
+  }, [startTyping, reset, runPython, stopExecution]);
 
   // Keyboard Shortcuts
   useEffect(() => {
@@ -703,16 +609,6 @@ export default function App() {
 
       // If we are in an input, don't trigger single-key shortcuts
       if (isInput) return;
-
-      // R: Toggle Recording
-      if (e.key.toLowerCase() === 'r' && !isMod) {
-        e.preventDefault();
-        if (stateRef.current.isRecording) {
-          stopRecordingRef.current();
-        } else {
-          startRecordingRef.current();
-        }
-      }
 
       // Space: Play/Pause
       if (e.key === ' ' || e.code === 'Space') {
@@ -775,15 +671,19 @@ export default function App() {
                 {state.language === 'python' && (
                   <div className="flex items-center gap-1.5">
                     <div className="w-1 h-1 rounded-full bg-zinc-500" />
-                    <span className={cn(
-                      "text-[10px] font-bold uppercase tracking-tighter",
-                      state.pyodideStatus === 'ready' ? "text-emerald-500" : 
-                      state.pyodideStatus === 'loading' ? "text-amber-500 animate-pulse" : 
-                      state.pyodideStatus === 'error' ? "text-red-500" : "text-zinc-500"
-                    )}>
+                    <span 
+                      onClick={() => state.pyodideStatus === 'error' && initPyodide()}
+                      className={cn(
+                        "text-[10px] font-bold uppercase tracking-tighter transition-all",
+                        state.pyodideStatus === 'ready' ? "text-emerald-500" : 
+                        state.pyodideStatus === 'loading' ? "text-amber-500 animate-pulse" : 
+                        state.pyodideStatus === 'error' ? "text-red-500 cursor-pointer hover:underline" : "text-zinc-500"
+                      )}
+                      title={state.pyodideStatus === 'error' ? "Click to retry loading Python" : undefined}
+                    >
                       {state.pyodideStatus === 'ready' ? 'Python Ready' : 
                        state.pyodideStatus === 'loading' ? 'Loading Python...' : 
-                       state.pyodideStatus === 'error' ? 'Python Error' : 'Python Idle'}
+                       state.pyodideStatus === 'error' ? 'Python Error (Retry)' : 'Python Idle'}
                     </span>
                   </div>
                 )}
@@ -921,40 +821,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Recording Settings */}
-          <div className="space-y-4">
-            <label className="text-xs font-semibold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-              <Video className="w-3 h-3" /> Recording Settings
-            </label>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <span className="text-[10px] text-zinc-500 uppercase font-bold">Format</span>
-                <select
-                  value={state.exportFormat}
-                  onChange={(e) => setState(prev => ({ ...prev, exportFormat: e.target.value as any }))}
-                  className={cn(
-                    "w-full border rounded-lg p-2 text-xs focus:outline-none transition-all",
-                    state.theme === 'dark' ? "bg-black/40 border-white/5" : "bg-zinc-50 border-zinc-200"
-                  )}
-                >
-                  <option value="mp4">MP4 (WebM)</option>
-                  <option value="gif">GIF</option>
-                </select>
-              </div>
-              <div className="space-y-2">
-                <span className="text-[10px] text-zinc-500 uppercase font-bold">FPS: {state.fps}</span>
-                <input
-                  type="range"
-                  min="5"
-                  max="60"
-                  value={state.fps}
-                  onChange={(e) => setState(prev => ({ ...prev, fps: parseInt(e.target.value) }))}
-                  className="w-full h-1 rounded-lg accent-emerald-500"
-                />
-              </div>
-            </div>
-          </div>
-
           {/* Background Customization */}
           <div className="space-y-4">
             <label className="text-xs font-semibold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
@@ -1077,7 +943,6 @@ export default function App() {
               { key: 'Ctrl+Enter', label: 'Animate' },
               { key: 'Ctrl+Shift+Enter', label: 'Run Python' },
               { key: 'Ctrl+R', label: 'Reset' },
-              { key: 'R', label: 'Record' },
               { key: 'C', label: 'Console' },
               { key: 'X', label: 'Clear' },
               { key: 'M', label: 'Sound' },
@@ -1115,18 +980,6 @@ export default function App() {
                 <div className="w-3 h-3 rounded-full bg-emerald-500/20 border border-emerald-500/30" />
               </div>
               <div className="flex items-center gap-4">
-                <button
-                  onClick={state.isRecording ? stopRecording : startRecording}
-                  className={cn(
-                    "flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-mono uppercase tracking-widest transition-all",
-                    state.isRecording 
-                      ? "bg-red-500 text-white animate-pulse" 
-                      : (state.theme === 'dark' ? "bg-white/5 text-zinc-400 hover:text-white hover:bg-white/10" : "bg-zinc-100 text-zinc-600 hover:text-zinc-900 hover:bg-zinc-200")
-                  )}
-                >
-                  {state.isRecording ? <Video className="w-3 h-3" /> : <Camera className="w-3 h-3" />}
-                  {state.isRecording ? 'Recording...' : 'Record GIF'}
-                </button>
                 <div className={cn(
                   "h-px flex-1 mx-4 transition-colors duration-300",
                   state.theme === 'dark' ? "bg-white/5" : "bg-zinc-200"
@@ -1191,7 +1044,6 @@ export default function App() {
                         state.theme === 'light' && "text-zinc-800",
                         state.isTyping && "typing-cursor"
                       )} style={{ lineHeight: '1.5rem' }}>
-                        {state.displayedCode}
                       </code>
                     </pre>
                   </motion.div>
@@ -1238,14 +1090,20 @@ export default function App() {
                 <div className="whitespace-pre-wrap">
                   {state.output}
                   {state.isWaitingForInput && (
-                    <span className="inline-flex items-center gap-1">
-                      <input
+                    <div className="mt-1">
+                      <textarea
                         ref={consoleInputRef}
-                        type="text"
+                        rows={1}
                         value={state.currentInputValue}
-                        onChange={(e) => setState(prev => ({ ...prev, currentInputValue: e.target.value }))}
+                        onChange={(e) => {
+                          setState(prev => ({ ...prev, currentInputValue: e.target.value }));
+                          // Auto-resize
+                          e.target.style.height = 'auto';
+                          e.target.style.height = e.target.scrollHeight + 'px';
+                        }}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
                             const val = state.currentInputValue;
                             setState(prev => ({ 
                               ...prev, 
@@ -1259,11 +1117,11 @@ export default function App() {
                             }
                           }
                         }}
-                        className="bg-transparent border-none outline-none text-zinc-300 caret-emerald-500 min-w-[1ch]"
-                        style={{ width: `${Math.max(1, state.currentInputValue.length)}ch` }}
+                        className="bg-transparent border-none outline-none text-emerald-400 caret-emerald-500 w-full resize-none overflow-hidden p-0 m-0 block"
+                        placeholder="Type your input here..."
                         autoFocus
                       />
-                    </span>
+                    </div>
                   )}
                 </div>
               </div>
